@@ -1,0 +1,18 @@
+[project]
+name = "ai-saas-website"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "argon2-cffi>=25.1.0",
+    "fastapi[standard]>=0.133.1",
+    "httpx>=0.28.1",
+    "passlib[bcrypt]>=1.7.4",
+    "pydantic-settings>=2.13.1",
+    "pyjwt[crypto]>=2.11.0",
+    "python-jose[cryptography]>=3.5.0",
+    "sqlalchemy>=2.0.47",
+    "stripe>=14.4.0",
+    "uvicorn[standard]>=0.41.0",
+]
