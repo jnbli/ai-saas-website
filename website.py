@@ -1,13 +1,22 @@
 import os
 import sqlite3
 from contextlib import asynccontextmanager
-from datetime import datetime  # ← Added this import
+from datetime import datetime
 
 import requests
 from argon2 import PasswordHasher, exceptions
-from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
+from fastapi import BackgroundTasks, Depends, FastAPI, Form, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import OAuth2PasswordRequestForm
+
+import stripe
+from dotenv import load_dotenv
+
+load_dotenv()
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+PRICE_ID = os.getenv("STRIPE_PRICE_ID_MONTHLY")
+BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
 
 app = FastAPI()
 
@@ -325,6 +334,8 @@ def ensure_bifrost_access(username: str, db: sqlite3.Connection) -> str:
 async def lifespan(app: FastAPI):
     conn = sqlite3.connect("users.db", check_same_thread=False)
     cur = conn.cursor()
+
+    # Create table if not exists
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
@@ -336,17 +347,31 @@ async def lifespan(app: FastAPI):
             bifrost_vk_value TEXT
         )
     """)
-    # Migrate columns if missing
+
+    # Migrate columns if missing – ignore if already exists
     cur.execute("PRAGMA table_info(users)")
     cols = {row[1] for row in cur.fetchall()}
-    for col in [
+
+    new_columns = [
         "bifrost_customer_name",
         "bifrost_customer_id",
         "bifrost_vk_id",
         "bifrost_vk_value",
-    ]:
+        "stripe_customer_id",
+        "stripe_subscription_id",
+    ]
+
+    for col in new_columns:
         if col not in cols:
-            cur.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
+            try:
+                cur.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
+                print(f"[MIGRATION] Added column: {col}")
+            except sqlite3.OperationalError as e:
+                if "duplicate column name" in str(e):
+                    print(f"[MIGRATION] Column {col} already exists – skipping")
+                else:
+                    raise  # re-raise other real errors
+
     conn.commit()
     app.state.db = conn
     yield
@@ -505,35 +530,183 @@ async def dashboard_page(request: Request):
 async def subscribe(request: Request):
     username = request.cookies.get("username")
     if not username:
-        raise HTTPException(401)
-    db = get_db(request)
-    try:
-        ensure_bifrost_access(username, db)
-    except Exception as e:
-        raise HTTPException(500, f"Bifrost error: {str(e)}")
-    db.execute("UPDATE users SET paid = 1 WHERE username = ?", (username,))
-    db.commit()
-    return RedirectResponse("/dashboard", status_code=303)
+        raise HTTPException(401, "Not logged in")
 
+    db = get_db(request)
+
+    # Optional: already paid? → early exit or show portal
+    cur = db.cursor()
+    cur.execute("SELECT paid FROM users WHERE username = ?", (username,))
+    if cur.fetchone()[0]:
+        return RedirectResponse("/dashboard", 303)
+
+    try:
+        # Create or get Stripe customer (you can store stripe_customer_id in DB later)
+        # For MVP we create ephemeral customer via email (you'll need user email later)
+
+        checkout_session = stripe.checkout.Session.create(
+            mode="subscription",
+            payment_method_types=["card"],
+            line_items=[{
+                "price": PRICE_ID,          # ← your monthly price ID
+                "quantity": 1,
+            }],
+            success_url = f"{BASE_URL}/success?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url = f"{BASE_URL}/checkout-cancelled",
+            client_reference_id = username,     # very useful!
+            # subscription_data={
+            #     "trial_period_days": 7,       # optional trial
+            # },
+            # customer_email = user_email,      # if you collect email
+        )
+
+        return RedirectResponse(checkout_session.url, status_code=303)
+
+    except stripe.error.StripeError as e:
+        raise HTTPException(400, str(e.user_message))
+    except Exception as e:
+        raise HTTPException(500, "Payment service error")
+
+@app.get("/success", response_class=HTMLResponse)
+async def success(request: Request, session_id: str | None = None):
+    if not session_id:
+        return "<h2>Thank you — but something went wrong (no session)</h2><a href='/dashboard'>Back</a>"
+
+    # For MVP we don't verify here — webhook will do the real work
+    # Later: you can retrieve session and show receipt
+
+    return """
+    <h2>Thank you! Subscription activated.</h2>
+    <p>Your AI access should now be unlocked.</p>
+    <a href="/dashboard">Go to dashboard</a>
+    """
+
+@app.get("/checkout-cancelled", response_class=HTMLResponse)
+async def checkout_cancelled():
+    return """
+    <h2>Subscription setup was cancelled</h2>
+    <p>No payment was made. You can try again from the dashboard.</p>
+    <a href="/dashboard">Back to dashboard</a>
+    """
 
 @app.post("/cancel")
 async def cancel(request: Request):
     username = request.cookies.get("username")
     if not username:
-        raise HTTPException(401)
+        raise HTTPException(401, "Not logged in")
+
     db = get_db(request)
     cur = db.cursor()
-    cur.execute("SELECT bifrost_vk_id FROM users WHERE username = ?", (username,))
+
+    # Get stored subscription ID
+    cur.execute(
+        "SELECT stripe_subscription_id, bifrost_vk_id FROM users WHERE username = ?",
+        (username,)
+    )
     row = cur.fetchone()
-    if row and row[0]:
+    if not row:
+        raise HTTPException(404, "User not found")
+
+    sub_id, vk_id = row
+
+    # Optional: Already no sub? Just local cleanup
+    if not sub_id:
+        print(f"[CANCEL] No Stripe sub found for {username} – local cleanup only")
+    else:
         try:
-            deactivate_virtual_key(row[0])
-        except Exception:
-            pass  # best effort
-    db.execute("UPDATE users SET paid = 0 WHERE username = ?", (username,))
+            # Cancel immediately (or change to cancel_at_period_end=True)
+            stripe.Subscription.delete(sub_id)
+            print(f"[CANCEL] Stripe subscription {sub_id} canceled for {username}")
+        except stripe.error.InvalidRequestError as e:
+            if "No such subscription" in str(e):
+                print(f"[CANCEL] Subscription {sub_id} already gone or invalid")
+            else:
+                raise HTTPException(500, f"Stripe cancel failed: {str(e)}")
+        except stripe.error.StripeError as e:
+            raise HTTPException(500, f"Stripe error: {str(e.user_message)}")
+
+    # Local revocation
+    if vk_id:
+        try:
+            deactivate_virtual_key(vk_id)
+            print(f"[CANCEL] Bifrost key {vk_id} deactivated")
+        except Exception as e:
+            print(f"[CANCEL] Bifrost deactivation failed: {e}")
+
+    # Update DB
+    cur.execute(
+        "UPDATE users SET paid = 0, stripe_subscription_id = NULL WHERE username = ?",
+        (username,)
+    )
     db.commit()
+
     return RedirectResponse("/dashboard", status_code=303)
 
+@app.post("/webhook/stripe")
+async def stripe_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks
+):
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+    if not sig_header:
+        raise HTTPException(400)
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload,
+            sig_header,
+            STRIPE_WEBHOOK_SECRET
+        )
+    except ValueError:
+        raise HTTPException(400, "Invalid payload")
+    except stripe.error.SignatureVerificationError:
+        raise HTTPException(400, "Invalid signature")
+
+    # Return 200 immediately — Stripe is happy
+    background_tasks.add_task(process_stripe_event, event)
+    return {"status": "received"}
+
+
+def process_stripe_event(event):
+    # This runs in background — no request context, so open DB manually
+    conn = sqlite3.connect("users.db", check_same_thread=False)
+    try:
+        cur = conn.cursor()
+
+        if event["type"] == "checkout.session.completed":
+            session = event["data"]["object"]
+            username = session.get("client_reference_id")
+            if username:
+                print(f"[WEBHOOK] Processing completed checkout for user: {username}")
+                customer_id = session.get("customer")           # "cus_..."
+                subscription_id = session.get("subscription")   # "sub_..."
+                cur.execute(
+                    """
+                    UPDATE users
+                    SET paid = 1,
+                        stripe_customer_id = ?,
+                        stripe_subscription_id = ?
+                    WHERE username = ?
+                    """,
+                    (customer_id, subscription_id, username)
+                )
+                print(f"[WEBHOOK] Rows updated: {cur.rowcount}")
+                conn.commit()
+                try:
+                    ensure_bifrost_access(username, conn)
+                    print(f"[WEBHOOK] Bifrost key ensured/activated for {username}")
+                except Exception as e:
+                    print(f"[WEBHOOK] Bifrost error for {username}: {e}")
+
+        # You can add stubs for other events later
+        elif event["type"] in ["customer.subscription.deleted", "invoice.payment_succeeded"]:
+            print(f"[WEBHOOK] Received {event['type']} — handling coming soon")
+
+    except Exception as e:
+        print(f"[WEBHOOK] Background processing error: {e}")
+    finally:
+        conn.close()
 
 @app.get("/logout")
 async def logout():
